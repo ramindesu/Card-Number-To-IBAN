@@ -274,6 +274,37 @@ func TestCardToIBANClientClassifiesProviderUnavailableResponse(t *testing.T) {
 	}`, string(clientError.RawResponse))
 }
 
+func TestResponseErrorKindClassifiesAccessDeniedAsAuthentication(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		httpStatus int
+		metaCode   int
+	}{
+		"HTTP forbidden": {
+			httpStatus: http.StatusForbidden,
+			metaCode:   0,
+		},
+		"ZarinHub inaccessible code": {
+			httpStatus: http.StatusBadRequest,
+			metaCode:   9,
+		},
+	}
+
+	for name, testCase := range testCases {
+		testCase := testCase
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(
+				t,
+				cardclient.CardToIBANErrorKindAuthentication,
+				responseErrorKind(testCase.httpStatus, testCase.metaCode),
+			)
+		})
+	}
+}
+
 func TestCardToIBANClientClassifiesTimeout(t *testing.T) {
 	t.Parallel()
 

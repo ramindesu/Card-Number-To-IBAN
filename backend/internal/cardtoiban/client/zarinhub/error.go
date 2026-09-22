@@ -56,7 +56,10 @@ func requestError(cause error) *cardclient.CardToIBANError {
 
 func responseErrorKind(httpStatus, metaCode int) cardclient.CardToIBANErrorKind {
 	switch {
-	case httpStatus == http.StatusUnauthorized, metaCode == 6:
+	case httpStatus == http.StatusUnauthorized,
+		httpStatus == http.StatusForbidden,
+		metaCode == 6,
+		metaCode == 9:
 		return cardClientErrorKindAuthentication
 	case metaCode == 14:
 		return cardClientErrorKindTimeout
