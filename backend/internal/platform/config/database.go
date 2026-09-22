@@ -8,8 +8,6 @@ import (
 	"os"
 	"strconv"
 	"time"
-
-	"github.com/joho/godotenv"
 )
 
 const (
@@ -31,8 +29,8 @@ type Database struct {
 // LoadDatabase reads the local .env file when present and loads PostgreSQL
 // configuration from environment variables.
 func LoadDatabase() (Database, error) {
-	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return Database{}, fmt.Errorf("load .env: %w", err)
+	if err := loadEnvironmentFile(); err != nil {
+		return Database{}, err
 	}
 
 	port, err := loadPort("DATABASE_PORT")

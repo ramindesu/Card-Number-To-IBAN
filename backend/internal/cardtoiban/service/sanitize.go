@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/cardnumber"
 )
@@ -19,11 +20,7 @@ func sanitizeProviderResponse(rawResponse json.RawMessage) json.RawMessage {
 		return nil
 	}
 
-	if data, ok := response["data"].(map[string]any); ok {
-		if card, ok := data["card"].(string); ok {
-			data["card"] = cardnumber.Mask(cardnumber.Normalize(card))
-		}
-	}
+	sanitizeProviderValue(response)
 
 	sanitizedResponse, err := json.Marshal(response)
 	if err != nil {
@@ -31,4 +28,28 @@ func sanitizeProviderResponse(rawResponse json.RawMessage) json.RawMessage {
 	}
 
 	return sanitizedResponse
+}
+
+func sanitizeProviderValue(value any) {
+	switch typedValue := value.(type) {
+	case map[string]any:
+		property, hasProperty := typedValue["property"].(string)
+		propertyIsCard := hasProperty && strings.EqualFold(property, "card")
+
+		for key, nestedValue := range typedValue {
+			text, isText := nestedValue.(string)
+			if isText && (strings.EqualFold(key, "card") ||
+				(propertyIsCard && key == "attemptedValue")) {
+				typedValue[key] = cardnumber.Mask(cardnumber.Normalize(text))
+				continue
+			}
+
+			sanitizeProviderValue(nestedValue)
+		}
+
+	case []any:
+		for _, nestedValue := range typedValue {
+			sanitizeProviderValue(nestedValue)
+		}
+	}
 }
