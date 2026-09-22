@@ -23,5 +23,4 @@ type CardToIBANUpstreamAttempt struct {
 	ResponseJSON       json.RawMessage
 	StartedAt          time.Time
 	FinishedAt         *time.Time
-
 }
