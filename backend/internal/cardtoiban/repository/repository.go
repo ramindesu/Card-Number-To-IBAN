@@ -50,4 +50,5 @@ type CardToIBANRepository interface {
 	CompleteInquiry(context.Context, CardToIBANInquiryCompletion) error
 	CreateUpstreamAttempt(context.Context, model.CardToIBANUpstreamAttempt) error
 	CompleteUpstreamAttempt(context.Context, CardToIBANUpstreamAttemptCompletion) error
+	CreateDeadLetter(context.Context, model.CardToIBANDeadLetter) error
 }

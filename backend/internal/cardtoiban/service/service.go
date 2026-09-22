@@ -11,6 +11,7 @@ import (
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/cardnumber"
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/client"
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/model"
+	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/queue"
 	cardrepository "github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/repository"
 )
 
@@ -20,6 +21,10 @@ type CardToIBANServiceConfig struct {
 	Client         client.CardToIBANClient
 	FingerprintKey []byte
 	HandlingType   model.CardToIBANRequestHandlingType
+	Executor       queue.Executor
+	MaxAttempts    int
+	RetryBaseDelay time.Duration
+	Sleeper        func(context.Context, time.Duration) error
 	Clock          func() time.Time
 	IDGenerator    func() uuid.UUID
 }
@@ -31,6 +36,10 @@ type CardToIBANService struct {
 	client         client.CardToIBANClient
 	fingerprintKey []byte
 	handlingType   model.CardToIBANRequestHandlingType
+	executor       queue.Executor
+	maxAttempts    int
+	retryBaseDelay time.Duration
+	sleeper        func(context.Context, time.Duration) error
 	clock          func() time.Time
 	idGenerator    func() uuid.UUID
 }
@@ -57,6 +66,28 @@ func NewCardToIBANService(config CardToIBANServiceConfig) (*CardToIBANService, e
 		return nil, errors.New("invalid card-to-IBAN request handling type")
 	}
 
+	if config.Executor == nil {
+		config.Executor = queue.InlineExecutor{}
+	}
+
+	if config.MaxAttempts == 0 {
+		config.MaxAttempts = 1
+	}
+	if config.MaxAttempts < 1 || config.MaxAttempts > 5 {
+		return nil, errors.New("card-to-IBAN max attempts must be between 1 and 5")
+	}
+
+	if config.RetryBaseDelay == 0 {
+		config.RetryBaseDelay = 250 * time.Millisecond
+	}
+	if config.RetryBaseDelay < 0 {
+		return nil, errors.New("card-to-IBAN retry base delay must not be negative")
+	}
+
+	if config.Sleeper == nil {
+		config.Sleeper = sleepWithContext
+	}
+
 	if config.Clock == nil {
 		config.Clock = func() time.Time { return time.Now().UTC() }
 	}
@@ -70,6 +101,10 @@ func NewCardToIBANService(config CardToIBANServiceConfig) (*CardToIBANService, e
 		client:         config.Client,
 		fingerprintKey: append([]byte(nil), config.FingerprintKey...),
 		handlingType:   config.HandlingType,
+		executor:       config.Executor,
+		maxAttempts:    config.MaxAttempts,
+		retryBaseDelay: config.RetryBaseDelay,
+		sleeper:        config.Sleeper,
 		clock:          config.Clock,
 		idGenerator:    config.IDGenerator,
 	}, nil
@@ -112,86 +147,7 @@ func (s *CardToIBANService) Convert(
 		)
 	}
 
-	attemptID := s.idGenerator()
-	trackID := s.idGenerator()
-	attemptStartedAt := s.clock()
-	attempt := model.CardToIBANUpstreamAttempt{
-		ID:            attemptID,
-		InquiryID:     requestID,
-		AttemptNumber: 1,
-		TrackID:       trackID,
-		Status:        model.CardToIBANUpstreamAttemptStatusStarted,
-		HandlingType:  s.handlingType,
-		StartedAt:     attemptStartedAt,
-	}
-
-	if err := s.repository.CreateUpstreamAttempt(ctx, attempt); err != nil {
-		completedAt := s.clock()
-		s.bestEffortCompleteInquiryAsInternalError(ctx, requestID, startedAt, completedAt)
-		return CardToIBANResponse{}, newInternalError(requestID, err)
-	}
-
-	result, clientErr := s.client.Convert(ctx, client.CardToIBANRequest{
-		Card:         normalizedCard,
-		TrackID:      trackID,
-		HandlingType: s.handlingType,
-	})
-	completedAt := s.clock()
-
-	if clientErr != nil {
-		return CardToIBANResponse{}, s.completeUpstreamFailure(
-			ctx,
-			requestID,
-			attemptID,
-			startedAt,
-			attemptStartedAt,
-			completedAt,
-			clientErr,
-		)
-	}
-
-	upstreamHTTPStatus := result.HTTPStatus
-	metaCode := result.MetaCode
-	if err := s.repository.CompleteUpstreamAttempt(
-		ctx,
-		cardrepository.CardToIBANUpstreamAttemptCompletion{
-			ID:                 attemptID,
-			Status:             model.CardToIBANUpstreamAttemptStatusSucceeded,
-			UpstreamHTTPStatus: &upstreamHTTPStatus,
-			MetaCode:           &metaCode,
-			Duration:           elapsed(attemptStartedAt, completedAt),
-			ResponseJSON:       sanitizeProviderResponse(result.RawResponse),
-			FinishedAt:         completedAt,
-		},
-	); err != nil {
-		s.bestEffortCompleteInquiryAsInternalError(ctx, requestID, startedAt, completedAt)
-		return CardToIBANResponse{}, newInternalError(requestID, err)
-	}
-
-	if err := s.repository.CompleteInquiry(
-		ctx,
-		cardrepository.CardToIBANInquiryCompletion{
-			RequestID:          requestID,
-			Status:             model.CardToIBANInquiryStatusSucceeded,
-			ResponseHTTPStatus: http.StatusOK,
-			TotalDuration:      elapsed(startedAt, completedAt),
-			CompletedAt:        completedAt,
-		},
-	); err != nil {
-		return CardToIBANResponse{}, newInternalError(requestID, err)
-	}
-
-	return CardToIBANResponse{
-		RequestID:          requestID,
-		TrackID:            trackID,
-		BankName:           result.Data.BankName,
-		EnglishBankName:    result.Data.EnglishBankName,
-		IBAN:               result.Data.IBAN,
-		Deposit:            result.Data.Deposit,
-		DepositDescription: result.Data.DepositDescription,
-		DepositOwners:      result.Data.DepositOwners,
-		DepositStatus:      result.Data.DepositStatus,
-	}, nil
+	return s.convertWithRetry(ctx, requestID, startedAt, normalizedCard)
 }
 
 func (s *CardToIBANService) completeValidationFailure(

@@ -72,6 +72,7 @@ func TestCardToIBANServiceSuccess(t *testing.T) {
 	requestID := uuid.MustParse("11111111-1111-4111-8111-111111111111")
 	attemptID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
 	trackID := uuid.MustParse("33333333-3333-4333-8333-333333333333")
+	deadLetterID := uuid.MustParse("44444444-4444-4444-8444-444444444444")
 	startedAt := time.Date(2026, time.September, 22, 10, 0, 0, 0, time.UTC)
 	repository := &fakeCardToIBANRepository{}
 	providerClient := &fakeCardToIBANClient{
@@ -108,7 +109,7 @@ func TestCardToIBANServiceSuccess(t *testing.T) {
 			startedAt.Add(10*time.Millisecond),
 			startedAt.Add(760*time.Millisecond),
 		),
-		sequenceIDGenerator(requestID, attemptID, trackID),
+		sequenceIDGenerator(requestID, attemptID, trackID, deadLetterID),
 	)
 
 	response, err := applicationService.Convert(context.Background(), service.CardToIBANRequest{
@@ -224,6 +225,17 @@ func TestCardToIBANServiceTimeout(t *testing.T) {
 		http.StatusGatewayTimeout,
 		repository.completedInquiries[0].ResponseHTTPStatus,
 	)
+
+	require.Len(t, repository.deadLetters, 1)
+	assert.Equal(t, deadLetterID, repository.deadLetters[0].ID)
+	assert.Equal(t, requestID, repository.deadLetters[0].InquiryID)
+	assert.Equal(t, attemptID, repository.deadLetters[0].LastAttemptID)
+	assert.Equal(t, 1, repository.deadLetters[0].AttemptCount)
+	assert.Equal(
+		t,
+		model.CardToIBANDeadLetterReasonRetriesExhausted,
+		repository.deadLetters[0].Reason,
+	)
 }
 
 func TestCardToIBANServiceCreateInquiryFailure(t *testing.T) {
@@ -301,11 +313,13 @@ type fakeCardToIBANRepository struct {
 	completedInquiries []cardrepository.CardToIBANInquiryCompletion
 	createdAttempts    []model.CardToIBANUpstreamAttempt
 	completedAttempts  []cardrepository.CardToIBANUpstreamAttemptCompletion
+	deadLetters        []model.CardToIBANDeadLetter
 
 	createInquiryError         error
 	completeInquiryError       error
 	createUpstreamAttemptError error
 	completeUpstreamError      error
+	createDeadLetterError      error
 }
 
 func (r *fakeCardToIBANRepository) CreateInquiry(
@@ -338,6 +352,14 @@ func (r *fakeCardToIBANRepository) CompleteUpstreamAttempt(
 ) error {
 	r.completedAttempts = append(r.completedAttempts, completion)
 	return r.completeUpstreamError
+}
+
+func (r *fakeCardToIBANRepository) CreateDeadLetter(
+	_ context.Context,
+	deadLetter model.CardToIBANDeadLetter,
+) error {
+	r.deadLetters = append(r.deadLetters, deadLetter)
+	return r.createDeadLetterError
 }
 
 type fakeCardToIBANClient struct {

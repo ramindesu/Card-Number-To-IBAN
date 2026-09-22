@@ -10,6 +10,7 @@ import (
 
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/client"
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/model"
+	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/queue"
 	cardrepository "github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/repository"
 )
 
@@ -21,18 +22,14 @@ type upstreamFailureMapping struct {
 	message       string
 }
 
-func (s *CardToIBANService) completeUpstreamFailure(
+func (s *CardToIBANService) completeUpstreamAttemptFailure(
 	ctx context.Context,
-	requestID uuid.UUID,
 	attemptID uuid.UUID,
-	inquiryStartedAt time.Time,
 	attemptStartedAt time.Time,
 	completedAt time.Time,
-	upstreamErr error,
+	clientError *client.CardToIBANError,
+	mapping upstreamFailureMapping,
 ) error {
-	clientError := normalizeClientError(upstreamErr)
-	mapping := mapUpstreamFailure(clientError.Kind)
-
 	if err := s.repository.CompleteUpstreamAttempt(
 		ctx,
 		cardrepository.CardToIBANUpstreamAttemptCompletion{
@@ -46,13 +43,41 @@ func (s *CardToIBANService) completeUpstreamFailure(
 			FinishedAt:         completedAt,
 		},
 	); err != nil {
-		s.bestEffortCompleteInquiryAsInternalError(
-			ctx,
-			requestID,
-			inquiryStartedAt,
-			completedAt,
-		)
-		return newInternalError(requestID, err)
+		return err
+	}
+
+	return nil
+}
+
+func (s *CardToIBANService) completeFinalUpstreamFailure(
+	ctx context.Context,
+	requestID uuid.UUID,
+	lastAttemptID uuid.UUID,
+	attemptCount int,
+	inquiryStartedAt time.Time,
+	completedAt time.Time,
+	clientError *client.CardToIBANError,
+	mapping upstreamFailureMapping,
+) error {
+	if reason, shouldDeadLetter := deadLetterReason(clientError.Kind, attemptCount, s.maxAttempts); shouldDeadLetter {
+		if err := s.repository.CreateDeadLetter(ctx, model.CardToIBANDeadLetter{
+			ID:            s.idGenerator(),
+			InquiryID:     requestID,
+			LastAttemptID: lastAttemptID,
+			Reason:        reason,
+			AttemptCount:  attemptCount,
+			LastMetaCode:  clientError.MetaCode,
+			LastErrorType: clientError.ErrorType,
+			CreatedAt:     completedAt,
+		}); err != nil {
+			s.bestEffortCompleteInquiryAsInternalError(
+				ctx,
+				requestID,
+				inquiryStartedAt,
+				completedAt,
+			)
+			return newInternalError(requestID, err)
+		}
 	}
 
 	if err := s.repository.CompleteInquiry(
@@ -73,7 +98,7 @@ func (s *CardToIBANService) completeUpstreamFailure(
 		Message:    mapping.message,
 		HTTPStatus: mapping.httpStatus,
 		RequestID:  requestID,
-		Cause:      upstreamErr,
+		Cause:      clientError,
 	}
 }
 
@@ -83,10 +108,42 @@ func normalizeClientError(err error) *client.CardToIBANError {
 		return clientError
 	}
 
+	if errors.Is(err, queue.ErrFull) || errors.Is(err, queue.ErrClosed) {
+		errorType := "LocalQueueUnavailable"
+		return &client.CardToIBANError{
+			Kind:      client.CardToIBANErrorKindUnavailable,
+			ErrorType: &errorType,
+			Cause:     err,
+		}
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &client.CardToIBANError{
+			Kind:  client.CardToIBANErrorKindTimeout,
+			Cause: err,
+		}
+	}
+
 	return &client.CardToIBANError{
 		Kind:  client.CardToIBANErrorKindTransport,
 		Cause: err,
 	}
+}
+
+func deadLetterReason(
+	kind client.CardToIBANErrorKind,
+	attemptCount int,
+	maxAttempts int,
+) (model.CardToIBANDeadLetterReason, bool) {
+	if kind == client.CardToIBANErrorKindAuthentication {
+		return model.CardToIBANDeadLetterReasonAuthenticationFailed, true
+	}
+
+	if shouldRetry(kind) && attemptCount >= maxAttempts {
+		return model.CardToIBANDeadLetterReasonRetriesExhausted, true
+	}
+
+	return "", false
 }
 
 func mapUpstreamFailure(kind client.CardToIBANErrorKind) upstreamFailureMapping {

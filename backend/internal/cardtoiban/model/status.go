@@ -15,7 +15,6 @@ const (
 	CardToIBANInquiryStatusInternalError       CardToIBANInquiryStatus = "internal_error"
 )
 
-
 // IsValid reports whether the inquiry status is supported by the domain.
 func (s CardToIBANInquiryStatus) IsValid() bool {
 	switch s {

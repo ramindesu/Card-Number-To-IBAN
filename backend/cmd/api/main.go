@@ -15,6 +15,7 @@ import (
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/client/zarinhub"
 	cardhandler "github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/handler"
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/model"
+	cardqueue "github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/queue"
 	cardpostgres "github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/repository/postgres"
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/service"
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/platform/config"
@@ -53,6 +54,11 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("load card protection configuration: %w", err)
 	}
 
+	cardQueueConfig, err := config.LoadCardQueue()
+	if err != nil {
+		return fmt.Errorf("load Card-to-IBAN queue configuration: %w", err)
+	}
+
 	httpConfig, err := config.LoadHTTPServer()
 	if err != nil {
 		return fmt.Errorf("load HTTP configuration: %w", err)
@@ -74,11 +80,25 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("create ZarinHub client: %w", err)
 	}
 
+	queueExecutor, err := cardqueue.NewBoundedExecutor(cardqueue.Config{
+		Capacity:          cardQueueConfig.Capacity,
+		Workers:           cardQueueConfig.Workers,
+		RequestsPerSecond: cardQueueConfig.RequestsPerSecond,
+		Burst:             cardQueueConfig.Burst,
+	})
+	if err != nil {
+		return fmt.Errorf("create Card-to-IBAN queue: %w", err)
+	}
+	defer queueExecutor.Close()
+
 	repository := cardpostgres.NewCardToIBANRepository(pool)
 	applicationService, err := service.NewCardToIBANService(service.CardToIBANServiceConfig{
 		Repository:     repository,
 		Client:         providerClient,
 		FingerprintKey: cardProtectionConfig.FingerprintKey,
+		Executor:       queueExecutor,
+		MaxAttempts:    cardQueueConfig.MaxAttempts,
+		RetryBaseDelay: cardQueueConfig.RetryBaseDelay,
 		HandlingType: model.CardToIBANRequestHandlingType(
 			zarinHubConfig.RequestHandlingType,
 		),
