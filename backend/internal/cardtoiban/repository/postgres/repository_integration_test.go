@@ -52,6 +52,17 @@ func TestCardToIBANRepositoryLifecycle(t *testing.T) {
 
 	require.NoError(t, repository.CreateInquiry(ctx, inquiry))
 
+	invalidInquiry := model.CardToIBANInquiry{
+		RequestID:       uuid.New(),
+		CardMasked:      "invalid",
+		CardFingerprint: "d37d5d2eecbb3451dd4dd6632107f3bc53caa2c53158a131998d86f23f25d9e1",
+		ClientIP:        &clientIP,
+		Status:          model.CardToIBANInquiryStatusReceived,
+		CreatedAt:       now,
+	}
+
+	require.NoError(t, repository.CreateInquiry(ctx, invalidInquiry))
+
 	attemptID := uuid.New()
 	attempt := model.CardToIBANUpstreamAttempt{
 		ID:            attemptID,
