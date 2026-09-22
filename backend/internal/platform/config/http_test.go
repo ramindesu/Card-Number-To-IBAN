@@ -48,3 +48,20 @@ func TestCardProtectionRequiresLongFingerprintKey(t *testing.T) {
 		FingerprintKey: []byte("0123456789abcdef0123456789abcdef"),
 	}).Validate())
 }
+
+func TestCardQueueValidate(t *testing.T) {
+	t.Parallel()
+
+	configuration := config.CardQueue{
+		Capacity:          100,
+		Workers:           4,
+		RequestsPerSecond: 5,
+		Burst:             5,
+		MaxAttempts:       3,
+		RetryBaseDelay:    250 * time.Millisecond,
+	}
+
+	assert.NoError(t, configuration.Validate())
+	assert.Error(t, (config.CardQueue{MaxAttempts: 6}).Validate())
+	assert.Error(t, (config.CardQueue{RequestsPerSecond: 1001}).Validate())
+}

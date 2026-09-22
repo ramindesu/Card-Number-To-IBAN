@@ -15,6 +15,7 @@ import (
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/cardnumber"
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/client"
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/model"
+	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/queue"
 	cardrepository "github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/repository"
 	"github.com/ramindesu/Card-Number-To-IBAN/backend/internal/cardtoiban/service"
 )
@@ -72,7 +73,6 @@ func TestCardToIBANServiceSuccess(t *testing.T) {
 	requestID := uuid.MustParse("11111111-1111-4111-8111-111111111111")
 	attemptID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
 	trackID := uuid.MustParse("33333333-3333-4333-8333-333333333333")
-	deadLetterID := uuid.MustParse("44444444-4444-4444-8444-444444444444")
 	startedAt := time.Date(2026, time.September, 22, 10, 0, 0, 0, time.UTC)
 	repository := &fakeCardToIBANRepository{}
 	providerClient := &fakeCardToIBANClient{
@@ -109,7 +109,7 @@ func TestCardToIBANServiceSuccess(t *testing.T) {
 			startedAt.Add(10*time.Millisecond),
 			startedAt.Add(760*time.Millisecond),
 		),
-		sequenceIDGenerator(requestID, attemptID, trackID, deadLetterID),
+		sequenceIDGenerator(requestID, attemptID, trackID),
 	)
 
 	response, err := applicationService.Convert(context.Background(), service.CardToIBANRequest{
@@ -169,6 +169,7 @@ func TestCardToIBANServiceTimeout(t *testing.T) {
 	requestID := uuid.MustParse("11111111-1111-4111-8111-111111111111")
 	attemptID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
 	trackID := uuid.MustParse("33333333-3333-4333-8333-333333333333")
+	deadLetterID := uuid.MustParse("44444444-4444-4444-8444-444444444444")
 	startedAt := time.Date(2026, time.September, 22, 10, 0, 0, 0, time.UTC)
 	metaCode := 14
 	errorType := "RequestTimeOut"
@@ -192,7 +193,7 @@ func TestCardToIBANServiceTimeout(t *testing.T) {
 			startedAt.Add(10*time.Millisecond),
 			startedAt.Add(2*time.Second),
 		),
-		sequenceIDGenerator(requestID, attemptID, trackID),
+		sequenceIDGenerator(requestID, attemptID, trackID, deadLetterID),
 	)
 
 	_, err := applicationService.Convert(context.Background(), service.CardToIBANRequest{
@@ -236,6 +237,89 @@ func TestCardToIBANServiceTimeout(t *testing.T) {
 		model.CardToIBANDeadLetterReasonRetriesExhausted,
 		repository.deadLetters[0].Reason,
 	)
+}
+
+func TestCardToIBANServiceRetriesTransientFailureWithNewAttempt(t *testing.T) {
+	t.Parallel()
+
+	requestID := uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	firstAttemptID := uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	firstTrackID := uuid.MustParse("33333333-3333-4333-8333-333333333333")
+	secondAttemptID := uuid.MustParse("44444444-4444-4444-8444-444444444444")
+	secondTrackID := uuid.MustParse("55555555-5555-4555-8555-555555555555")
+	startedAt := time.Date(2026, time.September, 22, 10, 0, 0, 0, time.UTC)
+	metaCode := 7
+	errorType := "ProviderUnavailable"
+	repository := &fakeCardToIBANRepository{}
+	providerClient := &fakeCardToIBANClient{
+		outcomes: []fakeCardToIBANOutcome{
+			{
+				err: &client.CardToIBANError{
+					Kind:        client.CardToIBANErrorKindUnavailable,
+					MetaCode:    &metaCode,
+					ErrorType:   &errorType,
+					RawResponse: json.RawMessage(`{"data":null,"meta":{"code":7}}`),
+				},
+			},
+			{
+				result: client.CardToIBANResult{
+					HTTPStatus: http.StatusOK,
+					MetaCode:   0,
+					Data: client.CardToIBANData{
+						BankName: "بانک ملی ایران",
+						IBAN:     "IR820540102680020817909002",
+					},
+					RawResponse: json.RawMessage(`{"data":{"iban":"IR820540102680020817909002"},"meta":{"code":0}}`),
+				},
+			},
+		},
+	}
+	sleeps := make([]time.Duration, 0, 1)
+	applicationService, err := service.NewCardToIBANService(service.CardToIBANServiceConfig{
+		Repository:     repository,
+		Client:         providerClient,
+		FingerprintKey: []byte("0123456789abcdef0123456789abcdef"),
+		HandlingType:   model.CardToIBANRequestHandlingTypeStandard,
+		Executor:       queue.InlineExecutor{},
+		MaxAttempts:    2,
+		RetryBaseDelay: 250 * time.Millisecond,
+		Sleeper: func(_ context.Context, delay time.Duration) error {
+			sleeps = append(sleeps, delay)
+			return nil
+		},
+		Clock: sequenceClock(
+			startedAt,
+			startedAt.Add(10*time.Millisecond),
+			startedAt.Add(500*time.Millisecond),
+			startedAt.Add(510*time.Millisecond),
+			startedAt.Add(900*time.Millisecond),
+		),
+		IDGenerator: sequenceIDGenerator(
+			requestID,
+			firstAttemptID,
+			firstTrackID,
+			secondAttemptID,
+			secondTrackID,
+		),
+	})
+	require.NoError(t, err)
+
+	response, err := applicationService.Convert(context.Background(), service.CardToIBANRequest{
+		Card: "6037997512345670",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, secondTrackID, response.TrackID)
+	assert.Equal(t, "IR820540102680020817909002", response.IBAN)
+	assert.Equal(t, []time.Duration{250 * time.Millisecond}, sleeps)
+
+	require.Len(t, repository.createdAttempts, 2)
+	assert.Equal(t, 1, repository.createdAttempts[0].AttemptNumber)
+	assert.Equal(t, firstTrackID, repository.createdAttempts[0].TrackID)
+	assert.Equal(t, 2, repository.createdAttempts[1].AttemptNumber)
+	assert.Equal(t, secondTrackID, repository.createdAttempts[1].TrackID)
+	assert.Equal(t, model.CardToIBANUpstreamAttemptStatusUnavailable, repository.completedAttempts[0].Status)
+	assert.Equal(t, model.CardToIBANUpstreamAttemptStatusSucceeded, repository.completedAttempts[1].Status)
+	assert.Empty(t, repository.deadLetters)
 }
 
 func TestCardToIBANServiceCreateInquiryFailure(t *testing.T) {
@@ -366,6 +450,12 @@ type fakeCardToIBANClient struct {
 	requests []client.CardToIBANRequest
 	result   client.CardToIBANResult
 	err      error
+	outcomes []fakeCardToIBANOutcome
+}
+
+type fakeCardToIBANOutcome struct {
+	result client.CardToIBANResult
+	err    error
 }
 
 func (c *fakeCardToIBANClient) Convert(
@@ -373,5 +463,9 @@ func (c *fakeCardToIBANClient) Convert(
 	request client.CardToIBANRequest,
 ) (client.CardToIBANResult, error) {
 	c.requests = append(c.requests, request)
+	if index := len(c.requests) - 1; index < len(c.outcomes) {
+		outcome := c.outcomes[index]
+		return outcome.result, outcome.err
+	}
 	return c.result, c.err
 }

@@ -73,6 +73,9 @@ func NewBoundedExecutor(config Config) (*BoundedExecutor, error) {
 
 // Execute queues a task without blocking admission when capacity is exhausted.
 func (e *BoundedExecutor) Execute(ctx context.Context, task Task) error {
+	if ctx == nil {
+		return errors.New("queue context is required")
+	}
 	if task == nil {
 		return errors.New("queue task is required")
 	}
